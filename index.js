@@ -53,6 +53,16 @@ tokens.forEach((token, index) => {
   let connection;
   let player;
 
+  const safeDestroy = (conn) => {
+    try {
+      if (!conn) return;
+      const status = conn.state && conn.state.status;
+      if (status !== VoiceConnectionStatus.Destroyed) conn.destroy();
+    } catch (e) {
+      // ignore double-destroy or other race errors
+    }
+  };
+
   const handleBotCommand = async (commandName, reply, guild, member) => {
     if (!guild || !member) return reply('Command failed: missing guild or member data.');
 
@@ -67,7 +77,7 @@ tokens.forEach((token, index) => {
 
       setTimeout(async () => {
         try {
-          if (connection) connection.destroy();
+          safeDestroy(connection);
           connection = joinVoiceChannel({
             channelId: vc.id,
             guildId: guild.id,
@@ -116,7 +126,7 @@ tokens.forEach((token, index) => {
     }
 
     if (commandName === 'bclv') {
-      if (connection) connection.destroy();
+      safeDestroy(connection);
       return reply('✅ Left voice channel.');
     }
 
@@ -130,6 +140,11 @@ tokens.forEach((token, index) => {
 
     const reply = async text => {
       try {
+        const perms = message.channel.permissionsFor(message.guild?.members?.me ?? client.user);
+        if (!perms || !perms.has('SendMessages')) {
+          console.error(`[Bot ${botNum}] MESSAGE REPLY FAILED: Missing Permissions`);
+          return;
+        }
         await message.reply(text);
       } catch (err) {
         console.error(`[Bot ${botNum}] MESSAGE REPLY FAILED:`, err.message);
@@ -143,11 +158,18 @@ tokens.forEach((token, index) => {
     console.log(`[Bot ${botNum}] ONLINE ✅`);
 
     try {
-      const guilds = await client.guilds.fetch();
-      for (const [guildId, guild] of guilds) {
-        await guild.commands.set(slashCommands);
+      if (client.application && client.application.commands && typeof client.application.commands.set === 'function') {
+        await client.application.commands.set(slashCommands);
+        console.log(`[Bot ${botNum}] Registered global slash commands`);
+      } else {
+        const guilds = await client.guilds.fetch();
+        for (const [guildId, guild] of guilds) {
+          if (guild && guild.commands && typeof guild.commands.set === 'function') {
+            await guild.commands.set(slashCommands);
+          }
+        }
+        console.log(`[Bot ${botNum}] Registered slash commands in ${guilds.size} guild(s)`);
       }
-      console.log(`[Bot ${botNum}] Registered slash commands in ${guilds.size} guild(s)`);
     } catch (err) {
       console.error(`[Bot ${botNum}] SLASH COMMAND REGISTRATION FAILED: ${err.message}`);
     }
