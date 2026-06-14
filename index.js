@@ -5,6 +5,7 @@ const {
   createAudioPlayer, 
   createAudioResource, 
   AudioPlayerStatus,
+  entersState,
   VoiceConnectionStatus,
   StreamType
 } = require('@discordjs/voice');
@@ -20,10 +21,23 @@ require('libsodium-wrappers');
 
 // Health check
 const PORT = process.env.PORT || 8080;
-http.createServer((req, res) => {
+const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 1000;
+const healthServer = http.createServer((req, res) => {
   res.writeHead(200);
   res.end('10 Bots - Nuclear Stacked');
-}).listen(PORT);
+});
+
+healthServer.on('error', err => {
+  if (err.code === 'EADDRINUSE') {
+    console.warn(`[Health] Port ${PORT} in use; skipping health server.`);
+  } else {
+    console.error('[Health] Server error:', err);
+  }
+});
+
+healthServer.listen(PORT, () => {
+  console.log(`[Health] Listening on port ${PORT}`);
+});
 
 const tokens = [
   process.env.TOKEN1, process.env.TOKEN2, process.env.TOKEN3, process.env.TOKEN4, process.env.TOKEN5,
@@ -31,6 +45,14 @@ const tokens = [
 ].filter(t => t);
 
 console.log(`Starting ${tokens.length} bots in NUCLEAR STACKED mode...`);
+
+let sharedChstStartTime = 0;
+const getSharedChstStartTime = () => {
+  if (sharedChstStartTime <= Date.now()) {
+    sharedChstStartTime = Date.now() + 1500;
+  }
+  return sharedChstStartTime;
+};
 
 tokens.forEach((token, index) => {
   const botNum = index + 1;
@@ -44,20 +66,100 @@ tokens.forEach((token, index) => {
   });
 
   const slashCommands = [
-    { name: 'bcva', description: 'Make the bot join your voice channel' },
-    { name: 'bcst', description: 'Start normalized audio playback' },
-    { name: 'bcsp', description: 'Stop audio playback' },
-    { name: 'bclv', description: 'Leave the voice channel' }
+    { name: 'chva', description: 'Make the bot join your voice channel' },
+    { name: 'chst', description: 'Start audio playback (10x repeat)' },
+    { name: 'chsp', description: 'Stop audio playback' },
+    { name: 'chlv', description: 'Leave the voice channel' }
   ];
 
   let connection;
   let player;
+  let currentFfmpegProcess = null;
+  let stopRequested = false;
+  let isJoining = false;
+  let audioPlayCount = 0;
+  let maxAudioPlays = 10;
+
+  // Reusable playback starter so we can trigger playback from commands or auto-join
+  const startPlayback = async () => {
+    if (!connection) {
+      console.error(`[Bot ${botNum}] startPlayback called without a voice connection`);
+      return;
+    }
+
+    const baseAudio = path.join(__dirname, 'BOOGEYMAN.KX4.DARK.AUDIO.mp3');
+    const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+    const audioPath = fs.existsSync(botAudio) ? botAudio : baseAudio;
+
+    stopRequested = false;
+    audioPlayCount = 0;
+
+    const playOnce = async () => {
+      if (stopRequested) return;
+      if (audioPlayCount >= maxAudioPlays) {
+        console.log(`[Bot ${botNum}] 🔥 BOOGEYMAN COMPLETE - ${maxAudioPlays} plays finished`);
+        return;
+      }
+      audioPlayCount++;
+      console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays}) -> ${audioPath}`);
+
+      const ffmpegArgs = [
+        '-i', audioPath,
+        '-af', 'volume=1.7,acompressor=threshold=-18dB:ratio=4:attack=5:release=100,bass=g=8:f=100,equalizer=f=1000:width_type=o:width=2:g=4,dynaudnorm=p=1:m=5',
+        '-acodec', 'libopus',
+        '-b:a', '128k',
+        '-ac', '2',
+        '-ar', '48000',
+        '-f', 'opus',
+        'pipe:1'
+      ];
+
+      if (currentFfmpegProcess) {
+        currentFfmpegProcess.kill();
+        currentFfmpegProcess = null;
+      }
+
+      currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
+      const resource = createAudioResource(currentFfmpegProcess.stdout, {
+        inputType: StreamType.Opus,
+        inlineVolume: true
+      });
+
+      if (resource.volume) resource.volume.setVolume(0.9);
+
+      if (!player) {
+        player = createAudioPlayer();
+        player.on('error', err => console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message));
+        player.on('stateChange', (o, n) => {
+          console.log(`[Bot ${botNum}] AUDIO PLAYER STATE: ${o.status} -> ${n.status}`);
+          if (n.status === AudioPlayerStatus.Idle && !stopRequested && audioPlayCount < maxAudioPlays) {
+            setTimeout(() => {
+              playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
+            }, 100);
+          }
+        });
+      }
+
+      player.play(resource);
+      const subscription = connection.subscribe(player);
+      if (!subscription) console.error(`[Bot ${botNum}] FAILED TO SUBSCRIBE AUDIO PLAYER`);
+      else console.log(`[Bot ${botNum}] SUBSCRIBED audio player successfully`);
+
+      currentFfmpegProcess.stderr.on('data', chunk => console.error(`[Bot ${botNum}] FFMPEG: ${chunk.toString().trim()}`));
+      currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
+    };
+
+    // Start the first play
+    await playOnce();
+  };
 
   const safeDestroy = (conn) => {
     try {
       if (!conn) return;
       const status = conn.state && conn.state.status;
-      if (status !== VoiceConnectionStatus.Destroyed) conn.destroy();
+      if (status && status !== VoiceConnectionStatus.Destroyed) {
+        conn.destroy();
+      }
     } catch (e) {
       // ignore double-destroy or other race errors
     }
@@ -71,63 +173,125 @@ tokens.forEach((token, index) => {
       return reply('❌ You need **Administrator** permissions to use this command.');
     }
 
-    if (commandName === 'bcva') {
+    if (commandName === 'chva') {
+      if (isJoining) return reply('Already joining...');
+      
       const vc = member.voice.channel;
       if (!vc) return reply('You need to be in a voice channel first.');
 
+      isJoining = true;
+      // increase stagger to avoid simultaneous IP discovery failures
       setTimeout(async () => {
         try {
-          safeDestroy(connection);
-          connection = joinVoiceChannel({
+          // Only destroy if connection exists and not destroyed
+          if (connection) {
+            const status = connection.state && connection.state.status;
+            if (status && status !== VoiceConnectionStatus.Destroyed) {
+              connection.destroy();
+            }
+          }
+          
+              connection = joinVoiceChannel({
             channelId: vc.id,
             guildId: guild.id,
             adapterCreator: guild.voiceAdapterCreator,
             selfDeaf: true,
             group: client.user.id
           });
+          // prevent uncaught 'error' events from killing the process
+          connection.on('error', err => {
+            console.error(`[Bot ${botNum}] VOICE CONNECTION ERROR:`, err?.message || err);
+            try { safeDestroy(connection); } catch (e) {}
+          });
+          connection.on(VoiceConnectionStatus.Ready, () => {
+            console.log(`[Bot ${botNum}] VOICE READY`);
+          });
+          connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
+            console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
+          });
+          connection.on(VoiceConnectionStatus.Destroyed, () => {
+            console.log(`[Bot ${botNum}] VOICE DESTROYED`);
+          });
+          connection.on('stateChange', (oldState, newState) => {
+            console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
+          });
+          await entersState(connection, VoiceConnectionStatus.Ready, 15000);
           console.log(`[Bot ${botNum}] JOINED ✅`);
           await reply('✅ Joined your voice channel.');
         } catch (err) {
           console.error(`[Bot ${botNum}] JOIN ERROR:`, err.message);
           await reply('❌ Failed to join voice channel.');
+        } finally {
+          isJoining = false;
         }
-      }, botNum * 200);
+      }, botNum * JOIN_STAGGER_MS);
 
       return;
     }
 
-    if (commandName === 'bcst') {
+    if (commandName === 'chst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      const audioPath = path.join(__dirname, 'mega_loud.mp3');
-      if (!fs.existsSync(audioPath)) return reply('Audio file not found.');
-
-      setTimeout(() => {
-        const resource = createAudioResource(audioPath, {
-          inlineVolume: true
-        });
-
-        if (resource.volume) {
-          resource.volume.setVolume(1.0);
+      // Ensure per-bot file exists (created previously at startup or on demand)
+      const baseAudio = path.join(__dirname, 'BOOGEYMAN.KX4.DARK.AUDIO.mp3');
+      const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
+      if (!fs.existsSync(baseAudio)) return reply('BOOGEYMAN audio file not found.');
+      if (!fs.existsSync(botAudio)) {
+        try {
+          fs.copyFileSync(baseAudio, botAudio);
+          console.log(`[Bot ${botNum}] Created per-bot audio file: ${botAudio}`);
+        } catch (err) {
+          console.error(`[Bot ${botNum}] Failed to create per-bot audio file:`, err.message);
+          return reply('❌ Failed to prepare per-bot audio file.');
         }
+      }
 
-        player = createAudioPlayer();
-        player.play(resource);
-        connection.subscribe(player);
-        console.log(`[Bot ${botNum}] AUDIO PLAYING`);
-      }, botNum * 100);
+      // Align start time across bots for synchronized playback
+      const startAt = getSharedChstStartTime();
+      const delay = Math.max(100, startAt - Date.now());
+      setTimeout(() => {
+        startPlayback().catch(err => console.error(`[Bot ${botNum}] startPlayback error:`, err?.message || err));
+      }, delay);
 
-      return reply('✅ Started audio playback.');
+      return reply('🔥 BOOGEYMAN 10x REPEAT ACTIVATED (Boosted Audio)');
     }
 
-    if (commandName === 'bcsp') {
-      if (player) player.stop();
+    if (commandName === 'chsp') {
+      stopRequested = true;
+      audioPlayCount = 0;
+      if (player) {
+        player.stop(true);
+      }
+      if (currentFfmpegProcess) {
+        currentFfmpegProcess.kill();
+        currentFfmpegProcess = null;
+      }
       return reply('✅ Audio stopped.');
     }
 
-    if (commandName === 'bclv') {
+    if (commandName === 'chlv') {
       safeDestroy(connection);
+      connection = null;
       return reply('✅ Left voice channel.');
+    }
+
+    if (commandName === 'status') {
+      try {
+        const connState = connection ? (connection.state && connection.state.status) : 'not connected';
+        const channelId = connection && connection.joinConfig ? connection.joinConfig.channelId : (connection && connection.joining ? connection.joining.channelId : 'none');
+        const playerState = player ? (player.state && player.state.status) : 'no player';
+        const ffmpegRunning = currentFfmpegProcess ? true : false;
+        const msg = `Connection: ${connState}\nChannel: ${channelId}\nPlayer: ${playerState}\nFFmpeg running: ${ffmpegRunning}`;
+        await reply(`
+
+
+${msg}
+`);
+      } catch (e) {
+        console.error(`[Bot ${botNum}] STATUS CMD ERROR:`, e.message);
+        await reply('Failed to retrieve status.');
+      }
+      return;
     }
 
     return reply('Unknown command.');
@@ -136,7 +300,7 @@ tokens.forEach((token, index) => {
   client.on('messageCreate', async message => {
     if (message.author.bot) return;
     const content = message.content.trim().toLowerCase();
-    if (!['!bcva', '!bcst', '!bcsp', '!bclv'].includes(content)) return;
+    if (!['!chva', '!chst', '!chsp', '!chlv', '!status'].includes(content)) return;
 
     const reply = async text => {
       try {
@@ -172,6 +336,44 @@ tokens.forEach((token, index) => {
       }
     } catch (err) {
       console.error(`[Bot ${botNum}] SLASH COMMAND REGISTRATION FAILED: ${err.message}`);
+    }
+
+    // Auto-join and auto-start playback when environment variables are set.
+    try {
+      const envChannel = process.env[`AUTO_JOIN_CHANNEL_ID_${botNum}`] || process.env.AUTO_JOIN_CHANNEL_ID;
+      if (envChannel) {
+        try {
+          const targetChannel = await client.channels.fetch(envChannel).catch(() => null);
+          if (!targetChannel || !targetChannel.isVoiceBased && !targetChannel.isStageBased) {
+            console.warn(`[Bot ${botNum}] AUTO_JOIN: channel ${envChannel} not found or not a voice channel`);
+          } else {
+            // join
+            connection = joinVoiceChannel({
+              channelId: targetChannel.id,
+              guildId: targetChannel.guild.id,
+              adapterCreator: targetChannel.guild.voiceAdapterCreator,
+              selfDeaf: true,
+              group: client.user.id
+            });
+            connection.on('error', err => {
+              console.error(`[Bot ${botNum}] AUTO VOICE CONNECTION ERROR:`, err?.message || err);
+              try { safeDestroy(connection); } catch (e) {}
+            });
+            console.log(`[Bot ${botNum}] AUTO JOINED channel ${envChannel}`);
+            try {
+              await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+              console.log(`[Bot ${botNum}] AUTO VOICE READY`);
+              await startPlayback();
+            } catch (err) {
+              console.error(`[Bot ${botNum}] AUTO startPlayback failed:`, err?.message || err);
+            }
+          }
+        } catch (e) {
+          console.error(`[Bot ${botNum}] AUTO_JOIN error:`, e.message);
+        }
+      }
+    } catch (e) {
+      // ignore
     }
   });
 
