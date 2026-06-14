@@ -16,12 +16,109 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
+const MAX_JOIN_RETRIES = parseInt(process.env.MAX_JOIN_RETRIES, 10) || 3;
+const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 200;
+const JOIN_CONCURRENCY = parseInt(process.env.JOIN_CONCURRENCY, 10) || 5;
+const PCM_CONVERT_CONCURRENCY = parseInt(process.env.PCM_CONVERT_CONCURRENCY, 10) || 3;
+const joinQueue = [];
+const activeJoinTasks = new Set();
+let joinQueueProcessing = false;
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const processJoinQueue = async () => {
+  if (joinQueueProcessing) return;
+  joinQueueProcessing = true;
+  while (joinQueue.length > 0 || activeJoinTasks.size > 0) {
+    while (joinQueue.length > 0 && activeJoinTasks.size < JOIN_CONCURRENCY) {
+      const task = joinQueue.shift();
+      const promise = task().catch(err => console.error('[JoinQueue] task failed:', err?.message || err)).finally(() => {
+        activeJoinTasks.delete(promise);
+      });
+      activeJoinTasks.add(promise);
+      if (JOIN_STAGGER_MS > 0) await sleep(JOIN_STAGGER_MS);
+    }
+    if (activeJoinTasks.size > 0) {
+      await Promise.race(activeJoinTasks);
+    }
+  }
+  joinQueueProcessing = false;
+};
+
+const enqueueJoinTask = (task) => {
+  joinQueue.push(task);
+  if (!joinQueueProcessing) {
+    void processJoinQueue();
+  }
+};
+
+const convertAudioFile = async (inputPath, outputPath) => {
+  return new Promise((resolve, reject) => {
+    const conv = spawn(ffmpegPath, ['-y', '-i', inputPath, '-ar', '48000', '-ac', '2', '-f', 's16le', outputPath]);
+    conv.stderr.on('data', () => {});
+    conv.on('error', err => reject(err));
+    conv.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg convert failed with code ${code}`)));
+  });
+};
+
+const ensurePcmFile = async (audioPath) => {
+  const pcmPath = audioPath.replace(/\.mp3$/i, '.pcm');
+  if (fs.existsSync(pcmPath)) {
+    return pcmPath;
+  }
+  await convertAudioFile(audioPath, pcmPath);
+  return pcmPath;
+};
+
+const preconvertMissingAudioFiles = async () => {
+  const audioFiles = [];
+  for (let i = 1; i <= 10; i += 1) {
+    audioFiles.push(`BOOGEYMAN.KX4.DARK.AUDIO.${i}.mp3`);
+  }
+
+  console.log(`[PCM] Preconverting up to ${audioFiles.length} missing PCM files with concurrency ${PCM_CONVERT_CONCURRENCY}...`);
+
+  const tasks = audioFiles.map(file => async () => {
+    const audioPath = path.join(__dirname, file);
+    const pcmPath = audioPath.replace(/\.mp3$/i, '.pcm');
+    if (!fs.existsSync(audioPath)) {
+      console.log(`[PCM] SKIP missing audio file ${file}`);
+      return;
+    }
+    if (fs.existsSync(pcmPath)) return;
+    try {
+      await convertAudioFile(audioPath, pcmPath);
+      console.log(`[PCM] Converted ${file}`);
+    } catch (err) {
+      console.error(`[PCM] Failed to convert ${file}:`, err.message || err);
+    }
+  });
+
+  const active = [];
+  for (const task of tasks) {
+    while (active.length >= PCM_CONVERT_CONCURRENCY) {
+      await Promise.race(active);
+      for (let i = active.length - 1; i >= 0; i -= 1) {
+        if (active[i].isFulfilled || active[i].isRejected) {
+          active.splice(i, 1);
+        }
+      }
+    }
+    const promise = task();
+    promise.isFulfilled = false;
+    promise.isRejected = false;
+    promise.then(() => { promise.isFulfilled = true; }, () => { promise.isRejected = true; });
+    active.push(promise);
+  }
+  await Promise.allSettled(active);
+  console.log('[PCM] Preconversion complete.');
+};
+
 require('opusscript');
 require('libsodium-wrappers');
 
 // Health check
 const PORT = process.env.PORT || 8080;
-const JOIN_STAGGER_MS = parseInt(process.env.JOIN_STAGGER_MS, 10) || 1000;
 const healthServer = http.createServer((req, res) => {
   res.writeHead(200);
   res.end('10 Bots - Nuclear Stacked');
@@ -39,12 +136,22 @@ healthServer.listen(PORT, () => {
   console.log(`[Health] Listening on port ${PORT}`);
 });
 
-const tokens = [
-  process.env.TOKEN1, process.env.TOKEN2, process.env.TOKEN3, process.env.TOKEN4, process.env.TOKEN5,
-  process.env.TOKEN6, process.env.TOKEN7, process.env.TOKEN8, process.env.TOKEN9, process.env.TOKEN10
-].filter(t => t);
+const tokens = Object.entries(process.env)
+  .filter(([key, value]) => /^TOKEN\d+$/i.test(key) && value)
+  .sort((a, b) => {
+    const aIndex = parseInt(a[0].match(/\d+/)[0], 10);
+    const bIndex = parseInt(b[0].match(/\d+/)[0], 10);
+    return aIndex - bIndex;
+  })
+  .map(([, value]) => value);
+
+if (!tokens.length) {
+  throw new Error('No TOKEN environment variables found. Please set TOKEN1, TOKEN2, ...');
+}
 
 console.log(`Starting ${tokens.length} bots in NUCLEAR STACKED mode...`);
+
+void preconvertMissingAudioFiles().catch(err => console.error('[PCM] Preconversion error:', err));
 
 let sharedChstStartTime = 0;
 const getSharedChstStartTime = () => {
@@ -87,9 +194,7 @@ tokens.forEach((token, index) => {
       return;
     }
 
-    const baseAudio = path.join(__dirname, 'BOOGEYMAN.KX4.DARK.AUDIO.mp3');
-    const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
-    const audioPath = fs.existsSync(botAudio) ? botAudio : baseAudio;
+    const audioPath = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
 
     stopRequested = false;
     audioPlayCount = 0;
@@ -103,27 +208,23 @@ tokens.forEach((token, index) => {
       audioPlayCount++;
       console.log(`[Bot ${botNum}] 🔊 BOOGEYMAN PLAYING (${audioPlayCount}/${maxAudioPlays}) -> ${audioPath}`);
 
-      const ffmpegArgs = [
-        '-i', audioPath,
-        '-af', 'volume=1.7,acompressor=threshold=-18dB:ratio=4:attack=5:release=100,bass=g=8:f=100,equalizer=f=1000:width_type=o:width=2:g=4,dynaudnorm=p=1:m=5',
-        '-acodec', 'libopus',
-        '-b:a', '128k',
-        '-ac', '2',
-        '-ar', '48000',
-        '-f', 'opus',
-        'pipe:1'
-      ];
-
-      if (currentFfmpegProcess) {
-        currentFfmpegProcess.kill();
-        currentFfmpegProcess = null;
+      let resource;
+      try {
+        const pcmPath = await ensurePcmFile(audioPath);
+        const stream = fs.createReadStream(pcmPath);
+        resource = createAudioResource(stream, { inputType: StreamType.Raw, inlineVolume: true });
+      } catch (err) {
+        console.warn(`[Bot ${botNum}] PCM fallback to ffmpeg stream:`, err.message || err);
+        const ffmpegArgs = ['-i', audioPath, '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'];
+        if (currentFfmpegProcess) {
+          currentFfmpegProcess.kill();
+          currentFfmpegProcess = null;
+        }
+        currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
+        resource = createAudioResource(currentFfmpegProcess.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+        currentFfmpegProcess.stderr.on('data', chunk => console.error(`[Bot ${botNum}] FFMPEG: ${chunk.toString().trim()}`));
+        currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
       }
-
-      currentFfmpegProcess = spawn(ffmpegPath, ffmpegArgs);
-      const resource = createAudioResource(currentFfmpegProcess.stdout, {
-        inputType: StreamType.Opus,
-        inlineVolume: true
-      });
 
       if (resource.volume) resource.volume.setVolume(0.9);
 
@@ -131,7 +232,6 @@ tokens.forEach((token, index) => {
         player = createAudioPlayer();
         player.on('error', err => console.error(`[Bot ${botNum}] AUDIO PLAYER ERROR:`, err.message));
         player.on('stateChange', (o, n) => {
-          console.log(`[Bot ${botNum}] AUDIO PLAYER STATE: ${o.status} -> ${n.status}`);
           if (n.status === AudioPlayerStatus.Idle && !stopRequested && audioPlayCount < maxAudioPlays) {
             setTimeout(() => {
               playOnce().catch(err => console.error(`[Bot ${botNum}] playOnce error:`, err?.message || err));
@@ -143,13 +243,8 @@ tokens.forEach((token, index) => {
       player.play(resource);
       const subscription = connection.subscribe(player);
       if (!subscription) console.error(`[Bot ${botNum}] FAILED TO SUBSCRIBE AUDIO PLAYER`);
-      else console.log(`[Bot ${botNum}] SUBSCRIBED audio player successfully`);
-
-      currentFfmpegProcess.stderr.on('data', chunk => console.error(`[Bot ${botNum}] FFMPEG: ${chunk.toString().trim()}`));
-      currentFfmpegProcess.on('error', err => console.error(`[Bot ${botNum}] FFMPEG PROCESS ERROR:`, err.message));
     };
 
-    // Start the first play
     await playOnce();
   };
 
@@ -165,6 +260,59 @@ tokens.forEach((token, index) => {
     }
   };
 
+  const attemptJoinVoiceChannel = async (vc, guild, reply, attempt = 1) => {
+    try {
+      if (connection) {
+        safeDestroy(connection);
+        connection = null;
+      }
+
+      connection = joinVoiceChannel({
+        channelId: vc.id,
+        guildId: guild.id,
+        adapterCreator: guild.voiceAdapterCreator,
+        selfDeaf: true,
+        group: client.user.id
+      });
+
+      connection.on('error', err => {
+        console.error(`[Bot ${botNum}] VOICE CONNECTION ERROR:`, err?.message || err);
+        try { safeDestroy(connection); } catch (e) {}
+      });
+      connection.on(VoiceConnectionStatus.Ready, () => {
+        console.log(`[Bot ${botNum}] VOICE READY`);
+      });
+      connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
+        console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
+      });
+      connection.on(VoiceConnectionStatus.Destroyed, () => {
+        console.log(`[Bot ${botNum}] VOICE DESTROYED`);
+      });
+      connection.on('stateChange', (oldState, newState) => {
+        console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
+      });
+
+      await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+      console.log(`[Bot ${botNum}] JOINED ✅`);
+      await reply('✅ Joined your voice channel.');
+    } catch (err) {
+      console.error(`[Bot ${botNum}] JOIN ERROR attempt ${attempt}:`, err?.message || err);
+      safeDestroy(connection);
+      connection = null;
+      if (attempt < MAX_JOIN_RETRIES) {
+        const retryDelay = 1500 * attempt;
+        console.log(`[Bot ${botNum}] Retrying join in ${retryDelay}ms (attempt ${attempt + 1}/${MAX_JOIN_RETRIES})`);
+        await sleep(retryDelay);
+        return attemptJoinVoiceChannel(vc, guild, reply, attempt + 1);
+      }
+      await reply('❌ Failed to join voice channel after multiple attempts.');
+    } finally {
+      if (attempt === 1) {
+        isJoining = false;
+      }
+    }
+  };
+
   const handleBotCommand = async (commandName, reply, guild, member) => {
     if (!guild || !member) return reply('Command failed: missing guild or member data.');
 
@@ -175,56 +323,14 @@ tokens.forEach((token, index) => {
 
     if (commandName === 'chva') {
       if (isJoining) return reply('Already joining...');
-      
+
       const vc = member.voice.channel;
       if (!vc) return reply('You need to be in a voice channel first.');
 
       isJoining = true;
-      // increase stagger to avoid simultaneous IP discovery failures
-      setTimeout(async () => {
-        try {
-          // Only destroy if connection exists and not destroyed
-          if (connection) {
-            const status = connection.state && connection.state.status;
-            if (status && status !== VoiceConnectionStatus.Destroyed) {
-              connection.destroy();
-            }
-          }
-          
-              connection = joinVoiceChannel({
-            channelId: vc.id,
-            guildId: guild.id,
-            adapterCreator: guild.voiceAdapterCreator,
-            selfDeaf: true,
-            group: client.user.id
-          });
-          // prevent uncaught 'error' events from killing the process
-          connection.on('error', err => {
-            console.error(`[Bot ${botNum}] VOICE CONNECTION ERROR:`, err?.message || err);
-            try { safeDestroy(connection); } catch (e) {}
-          });
-          connection.on(VoiceConnectionStatus.Ready, () => {
-            console.log(`[Bot ${botNum}] VOICE READY`);
-          });
-          connection.on(VoiceConnectionStatus.Disconnected, (oldState, newState) => {
-            console.log(`[Bot ${botNum}] VOICE DISCONNECTED ${oldState.status} -> ${newState.status}`);
-          });
-          connection.on(VoiceConnectionStatus.Destroyed, () => {
-            console.log(`[Bot ${botNum}] VOICE DESTROYED`);
-          });
-          connection.on('stateChange', (oldState, newState) => {
-            console.log(`[Bot ${botNum}] VOICE STATE: ${oldState.status} -> ${newState.status}`);
-          });
-          await entersState(connection, VoiceConnectionStatus.Ready, 15000);
-          console.log(`[Bot ${botNum}] JOINED ✅`);
-          await reply('✅ Joined your voice channel.');
-        } catch (err) {
-          console.error(`[Bot ${botNum}] JOIN ERROR:`, err.message);
-          await reply('❌ Failed to join voice channel.');
-        } finally {
-          isJoining = false;
-        }
-      }, botNum * JOIN_STAGGER_MS);
+      enqueueJoinTask(async () => {
+        await attemptJoinVoiceChannel(vc, guild, reply);
+      });
 
       return;
     }
@@ -232,18 +338,11 @@ tokens.forEach((token, index) => {
     if (commandName === 'chst') {
       if (!connection) return reply('Bot is not in a voice channel.');
 
-      // Ensure per-bot file exists (created previously at startup or on demand)
-      const baseAudio = path.join(__dirname, 'BOOGEYMAN.KX4.DARK.AUDIO.mp3');
+      // Use bot-specific audio file (allow using pre-converted .pcm if .mp3 is missing)
       const botAudio = path.join(__dirname, `BOOGEYMAN.KX4.DARK.AUDIO.${botNum}.mp3`);
-      if (!fs.existsSync(baseAudio)) return reply('BOOGEYMAN audio file not found.');
-      if (!fs.existsSync(botAudio)) {
-        try {
-          fs.copyFileSync(baseAudio, botAudio);
-          console.log(`[Bot ${botNum}] Created per-bot audio file: ${botAudio}`);
-        } catch (err) {
-          console.error(`[Bot ${botNum}] Failed to create per-bot audio file:`, err.message);
-          return reply('❌ Failed to prepare per-bot audio file.');
-        }
+      const botPcm = botAudio.replace(/\.mp3$/i, '.pcm');
+      if (!fs.existsSync(botAudio) && !fs.existsSync(botPcm)) {
+        return reply(`BOOGEYMAN audio file ${botNum} not found (mp3 or pcm missing).`);
       }
 
       // Align start time across bots for synchronized playback
